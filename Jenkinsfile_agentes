@@ -1,0 +1,171 @@
+pipeline {
+    agent none
+    stages {
+
+        stage('Get Code') {
+            agent { label 'python' }
+            steps {
+                sh '''
+                    echo "=== STAGE: Get Code ==="
+                    whoami
+                    hostname
+                    echo "WORKSPACE=$WORKSPACE"
+                '''
+                git branch: 'master', url: 'https://github.com/NadianGG/practica_caso1.2.git'
+                stash includes: '**', name: 'repo'
+            }
+            post {
+                always {
+                    cleanWs()
+                }
+            }
+        }
+
+        stage('Parallel Stages') {
+            parallel {
+
+                stage('Static') {
+                    agent { label 'python' }
+                    steps {
+                        sh '''
+                            echo "=== STAGE: Static Analysis ==="
+                            whoami
+                            hostname
+                            echo "WORKSPACE=$WORKSPACE"
+                        '''
+                        unstash 'repo'
+                        sh '''
+                            echo "=== RUN FLAKE8 ==="
+                            python3 -m flake8 --exit-zero --format=pylint app > flake8.out
+                        '''
+                        recordIssues qualityGates: [
+                            [criticality: 'NOTE', integerThreshold: 8, threshold: 8.0, type: 'TOTAL'],
+                            [criticality: 'ERROR', integerThreshold: 10, threshold: 10.0, type: 'TOTAL']
+                        ],
+                        sourceCodeRetention: 'LAST_BUILD',
+                        tools: [flake8(pattern: 'flake8.out')]
+                    }
+                    post {
+                        always {
+                            cleanWs()
+                        }
+                    }
+                }
+
+                stage('Unit + Coverage') {
+                    agent { label 'python' }
+                    steps {
+                        sh '''
+                            echo "=== STAGE: Unit + Coverage ==="
+                            whoami
+                            hostname
+                            echo "WORKSPACE=$WORKSPACE"
+                        '''
+                        unstash 'repo'
+                        sh '''
+                            python3 -m coverage run --branch --source=app \
+                              --omit=app/__init__.py,app/api.py \
+                              -m pytest --junitxml=result-unit.xml test/unit
+                            python3 -m coverage xml
+                        '''
+                        junit 'result-unit.xml'
+                        recordCoverage qualityGates: [
+                            [criticality: 'NOTE',  metric: 'LINE',   threshold: 95.0],
+                            [criticality: 'ERROR', metric: 'LINE',   threshold: 85.0],
+                            [criticality: 'NOTE',  metric: 'BRANCH', threshold: 90.0],
+                            [criticality: 'ERROR', metric: 'BRANCH', threshold: 80.0]
+                        ],
+                        tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']]
+                    }
+                    post {
+                        always {
+                            cleanWs()
+                        }
+                    }
+                }
+
+                stage('Service') {
+                    agent { label 'python' }
+                    steps {
+                        sh '''
+                            echo "=== STAGE: Service ==="
+                            whoami
+                            hostname
+                            echo "WORKSPACE=$WORKSPACE"
+                        '''
+                        unstash 'repo'
+                        sh '''
+                            export FLASK_APP=app/api.py
+                            nohup python3 -m flask run &
+                            nohup java -jar /home/jenkins/tools/wiremock-standalone-3.13.2.jar \
+                                --port 9090 --root-dir test/wiremock &
+                            sleep 2
+                            python3 -m pytest --junitxml=result-rest.xml test/rest
+                        '''
+                        junit 'result-rest.xml'
+                    }
+                    post {
+                        always {
+                            cleanWs()
+                        }
+                    }
+                }
+
+                stage('Security') {
+                    agent { label 'python' }
+                    steps {
+                        sh '''
+                            echo "=== STAGE: Security ==="
+                            whoami
+                            hostname
+                            echo "WORKSPACE=$WORKSPACE"
+                        '''
+                        unstash 'repo'
+                        sh '''
+                            python3 -m bandit --exit-zero -r . -f custom \
+                              -o bandit.out \
+                              --msg-template "{abspath}:{line}: [{test_id}] {msg}"
+                        '''
+                        recordIssues qualityGates: [
+                            [integerThreshold: 2, threshold: 2.0, type: 'TOTAL'],
+                            [criticality: 'FAILURE', integerThreshold: 4, threshold: 4.0, type: 'TOTAL']
+                        ],
+                        sourceCodeRetention: 'LAST_BUILD',
+                        tools: [pyLint(name: 'Bandit', pattern: 'bandit.out')]
+                    }
+                    post {
+                        always {
+                            cleanWs()
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Performance') {
+            agent { label 'java' }
+            steps {
+                sh '''
+                    echo "=== STAGE: Performance ==="
+                    whoami
+                    hostname
+                    echo "WORKSPACE=$WORKSPACE"
+                '''
+                unstash 'repo'
+                sh '''
+                    export FLASK_APP=app/api.py
+                    nohup python3 -m flask run &
+                    sleep 2
+                    /home/jenkins/tools/apache-jmeter-5.6.3/bin/jmeter \
+                      -n -t test/jmeter/flask.jmx -f -l flask.jtl
+                '''
+                perfReport sourceDataFiles: 'flask.jtl'
+            }
+            post {
+                always {
+                    cleanWs()
+                }
+            }
+        }
+    }
+}
